@@ -43,8 +43,17 @@ async def async_get_triggers(hass: HomeAssistant, device_id: str) -> list[dict]:
     ]
 
 
-async def async_validate_trigger_config(trigger: dict) -> dict:
-    return TRIGGER_SCHEMA(trigger)
+async def async_validate_trigger_config(hass, config=None):
+    """校验设备触发器配置。
+
+    注意: HA 2026.6 起该回调的签名多了 hass 参数 (DeviceAutomationTriggerProtocol),
+    旧版本是 (config)。这里两种都能接受, 避免版本差异导致
+    "async_validate_trigger_config() takes 1 positional argument but 2 were given"
+    —— 那会让整个 automation 域 setup 失败, 所有自动化都变 unavailable。
+    """
+    if config is None:            # 兼容旧签名 async_validate_trigger_config(config)
+        hass, config = None, hass
+    return TRIGGER_SCHEMA(config)
 
 
 async def async_attach_trigger(hass, config, action, trigger_info):
@@ -56,6 +65,12 @@ async def async_attach_trigger(hass, config, action, trigger_info):
     device = dev_reg.async_get(device_id)
     cloud_ids = {ident[1] for ident in device.identifiers if ident[0] == DOMAIN} \
         if device else set()
+    # trigger_info.trigger_data 里带 id/idx/alias, 按 HA 标准触发器范式合并进
+    # trigger 变量 (参考 components/homeassistant/triggers/state.py)
+    trigger_data = {}
+    if isinstance(trigger_info, dict):
+        trigger_data = dict(trigger_info.get("trigger_data") or {})
+    device_name = device.name if device else device_id
 
     @callback
     def _handle(event):
@@ -64,8 +79,21 @@ async def async_attach_trigger(hass, config, action, trigger_info):
         if subtype != "other" and event.data.get("event_type") != subtype:
             return
         hass.async_run_job(action, {
-            "trigger": config,
-            "event": event.data,
+            "trigger": {
+                **trigger_data,
+                "platform": "device",
+                "domain": DOMAIN,
+                "device_id": device_id,
+                "type": subtype,
+                "event_type": event.data.get("event_type"),
+                "title": event.data.get("title"),
+                "time": event.data.get("time"),
+                "log_id": event.data.get("log_id"),
+                "has_media": event.data.get("has_media"),
+                # 同时保留 event 子字典, 与 event 平台触发器的用法保持一致
+                "event": dict(event.data),
+                "description": f"{EVENT_TYPES[subtype]['name']} of {device_name}",
+            }
         })
 
     return hass.bus.async_listen(EVENT_FIRE_TYPE, _handle)

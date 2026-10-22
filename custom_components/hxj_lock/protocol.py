@@ -349,7 +349,7 @@ class HxjClient:
 
     def listen_push(self, on_event, stop_event: threading.Event,
                     reconnect_delay: float = 3.0,
-                    max_lifetime: float = 45.0) -> None:
+                    max_lifetime: float = 20.0) -> None:
         """长连接监听服务端主动推送 (appCloudLockEventPush)。
 
         服务端会把门锁事件排队, 在客户端"下次鉴权"时才下发, 且空闲约 90s 会主动

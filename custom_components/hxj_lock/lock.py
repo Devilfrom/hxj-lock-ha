@@ -8,6 +8,7 @@ from homeassistant.components.lock import LockEntity, LockEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.exceptions import HomeAssistantError
 
@@ -52,6 +53,9 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
     """云锁实体。注意: 云端协议不反馈门闩实际状态, 默认显示 locked, 开锁后短暂显示 unlocked"""
 
     _attr_has_entity_name = True
+    # HA 2026.6 的 LockEntityFeature 只剩 OPEN(lock 域已改成"开/关"模型,
+    # LOCK/UNLOCK 枚举被移除 —— 引用不存在的枚举会让整个平台 import 失败)。
+    # LOCK 不声明: 服务端没有远程上锁接口, 声明了界面才会给出必然失败的上锁按钮。
     _attr_supported_features = LockEntityFeature.OPEN
 
     def __init__(self, coordinator: HxjLockCoordinator, device_id: str) -> None:
@@ -100,7 +104,21 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         }
 
     # ---------- 开锁 ----------
+    async def async_unlock(self, **kwargs) -> None:
+        """HA 界面「解锁」按钮 — 云锁的远程动作就是开锁"""
+        await self._async_cloud_open()
+
     async def async_open(self, **kwargs) -> None:
+        """HA 界面「打开」按钮"""
+        await self._async_cloud_open()
+
+    async def async_lock(self, **kwargs) -> None:
+        """云锁通道没有远程上锁接口, 给出明确原因而不是笼统的"不支持" """
+        raise HomeAssistantError(
+            "云锁通道不支持远程上锁: 服务端只提供 appCloudOpenLock。"
+            "关门由门体机械回锁完成, 完成后会以「关门」事件上报。")
+
+    async def _async_cloud_open(self) -> None:
         try:
             results = await self.coordinator.async_open_lock(self._device_id)
         except Exception as err:  # noqa: BLE001
@@ -114,8 +132,11 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         self._open_until = time.time() + UNLOCKED_DISPLAY_SECONDS
         self.async_write_ha_state()
         # 到点恢复 locked 显示
-        self.hass.helpers.event.async_call_later(
-            UNLOCKED_DISPLAY_SECONDS + 1, self._async_reset_state)
+        # 注意: 必须用模块级 async_call_later —— 新版 HA 已移除 HomeAssistant.helpers,
+        # 用 self.hass.helpers.event.async_call_later 会抛 AttributeError,
+        # 导致整个开锁服务返回 500 (界面表现为"开关锁报错", 其实锁已经开了)
+        async_call_later(
+            self.hass, UNLOCKED_DISPLAY_SECONDS + 1, self._async_reset_state)
 
     @callback
     def _async_reset_state(self, *_) -> None:

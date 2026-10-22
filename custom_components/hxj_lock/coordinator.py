@@ -56,6 +56,8 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         self._seen: dict[str, dict] = {}
         # 每台锁已知的最新事件时间戳: 用于丢弃服务端补推的历史事件
         self._newest_ts: dict[str, int] = {}
+        # 被丢弃的历史推送计数(只用于日志聚合)
+        self._stale_push_count = 0
         self._initialized = False
         # 门锁事件订阅者 (event 实体用它实时更新自身状态)
         self._event_sinks: list = []
@@ -288,9 +290,13 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         ts = int(data.get("createTime") or 0)
         if ts and ts <= self._newest_ts.get(did, 0):
             # 服务端在鉴权时会补推未读/历史事件: 早于已知最新事件的一律丢弃,
-            # 否则 HA 每次重启都会把几天前的旧事件再通知一遍
-            _LOGGER.debug("hxj_lock: 丢弃历史推送事件 logId=%s ts=%s",
-                          log_id, ts)
+            # 否则 HA 每次重启都会把几天前的旧事件再通知一遍。
+            # 服务端每次重连都补推全部历史, 所以这里聚合计数, 避免刷屏。
+            self._stale_push_count += 1
+            if self._stale_push_count % 20 == 1:
+                _LOGGER.debug(
+                    "hxj_lock: 已丢弃 %d 条历史推送事件 (早于已知最新事件)",
+                    self._stale_push_count)
             return
         seen = self._seen.setdefault(did, {})
         if log_id:
