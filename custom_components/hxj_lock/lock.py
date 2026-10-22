@@ -26,8 +26,11 @@ from .coordinator import HxjLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# 开门后实体显示 unlocked 的持续时间 (秒)
-UNLOCKED_DISPLAY_SECONDS = 10
+# 开锁后强制保持 "开"(unlocked) 的保底时长 (秒)。
+# 背景: 云锁开锁后, 锁体经常在数秒内自动机械回锁, 且云端常迟报/不上报关门事件,
+# 若 lock.state 直接读门状态, 会在开锁后瞬间跳回 locked, 表现为"刚点开锁又锁门"。
+# 这里给一个保底窗口, 让界面稳定显示"已开锁", 窗口结束后再按真实门状态判断。
+FORCE_UNLOCK_SECONDS = 120
 
 
 async def async_setup_entry(
@@ -73,7 +76,7 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
             "sw_version": info.get("softwareVersion"),
             "hw_version": info.get("hardwareVersion"),
         }
-        self._open_until: float = 0.0
+        self._force_unlock_until: float = 0.0
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -112,11 +115,11 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         """锁状态。
 
         云端不下发门闩状态, 所以这里用"最近一次开锁动作 + 事件推导的门状态":
-          - 刚通过 HA 远程开锁 (10 秒内)   -> unlocked (让界面立刻有反馈)
+          - 刚通过 HA 远程开锁 (保底窗口内) -> unlocked (忽略自动回锁造成的状态闪烁)
           - 事件推导出门是开着的            -> unlocked
           - 其余                            -> locked
         """
-        if time.time() < self._open_until:
+        if time.time() < self._force_unlock_until:
             return STATE_UNLOCKED
         if self.coordinator.get_door_state(self._device_id).get("state") == "open":
             return STATE_UNLOCKED
@@ -174,14 +177,14 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
                 f"远程开锁被拒绝: resultCode={resp.get('resultCode')} "
                 f"reason={resp.get('reason')}")
         _LOGGER.info("hxj_lock: %s 远程开锁成功", self._device_id)
-        self._open_until = time.time() + UNLOCKED_DISPLAY_SECONDS
+        self._force_unlock_until = time.time() + FORCE_UNLOCK_SECONDS
         self.async_write_ha_state()
-        # 到点恢复 locked 显示
+        # 到点恢复 (按门状态判断)
         # 注意: 必须用模块级 async_call_later —— 新版 HA 已移除 HomeAssistant.helpers,
         # 用 self.hass.helpers.event.async_call_later 会抛 AttributeError,
         # 导致整个开锁服务返回 500 (界面表现为"开关锁报错", 其实锁已经开了)
         async_call_later(
-            self.hass, UNLOCKED_DISPLAY_SECONDS + 1, self._async_reset_state)
+            self.hass, FORCE_UNLOCK_SECONDS + 1, self._async_reset_state)
 
     @callback
     def _async_reset_state(self, *_) -> None:
