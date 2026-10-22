@@ -75,6 +75,32 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         }
         self._open_until: float = 0.0
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # 订阅门锁事件: 门状态变化时立刻刷新锁状态
+        self.coordinator.register_event_sink(self._async_handle_event)
+        # 订阅门状态变化 (含兜底定时器触发的回锁)
+        self.coordinator.register_door_sink(self._async_handle_door_state)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self.coordinator.unregister_event_sink(self._async_handle_event)
+        self.coordinator.unregister_door_sink(self._async_handle_door_state)
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _async_handle_event(self, payload: dict) -> None:
+        """收到门锁事件 -> 刷新锁状态 (门开了就显示 unlocked)"""
+        if payload.get("device_id") != self._device_id:
+            return
+        self.async_write_ha_state()
+
+    @callback
+    def _async_handle_door_state(self, did: str) -> None:
+        """门状态变化 -> 刷新锁状态"""
+        if did != self._device_id:
+            return
+        self.async_write_ha_state()
+
     # ---------- 状态 ----------
     @property
     def available(self) -> bool:
@@ -83,7 +109,16 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
 
     @property
     def state(self) -> str:
+        """锁状态。
+
+        云端不下发门闩状态, 所以这里用"最近一次开锁动作 + 事件推导的门状态":
+          - 刚通过 HA 远程开锁 (10 秒内)   -> unlocked (让界面立刻有反馈)
+          - 事件推导出门是开着的            -> unlocked
+          - 其余                            -> locked
+        """
         if time.time() < self._open_until:
+            return STATE_UNLOCKED
+        if self.coordinator.get_door_state(self._device_id).get("state") == "open":
             return STATE_UNLOCKED
         return STATE_LOCKED
 
@@ -92,6 +127,7 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         dev = (self.coordinator.data or {}).get(self._device_id) or {}
         info = dev.get("info", {})
         events = dev.get("events", [])
+        door = self.coordinator.get_door_state(self._device_id)
         return {
             "device_id": self._device_id,
             "online": info.get("deviceState") == 3,
@@ -99,6 +135,9 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
             "device_mac": info.get("deviceMac"),
             "last_event": events[0]["time"] + " " + events[0]["title"] if events else None,
             "event_count": len(events),
+            "door_state": door.get("state"),
+            "door_state_name": {"open": "开", "closed": "关"}.get(
+                door.get("state"), "未知"),
             "remote_lock_supported": False,
             "note": "云锁通道仅支持远程开锁; 关门由门体机械回锁完成, 并以关门事件上报",
         }
@@ -113,10 +152,16 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
         await self._async_cloud_open()
 
     async def async_lock(self, **kwargs) -> None:
-        """云锁通道没有远程上锁接口, 给出明确原因而不是笼统的"不支持" """
-        raise HomeAssistantError(
-            "云锁通道不支持远程上锁: 服务端只提供 appCloudOpenLock。"
-            "关门由门体机械回锁完成, 完成后会以「关门」事件上报。")
+        """云锁通道没有远程上锁接口。
+
+        服务端只提供 appCloudOpenLock, 关门由门体机械回锁完成。
+        这里不抛异常 —— HA 的 lock 卡片在实体变成 unlocked 后会自动发一次
+        lock.lock 请求 (相当于"回锁"), 抛错会在日志里刷一片无意义的 traceback。
+        关门事件到达时门状态会自动置为"关", 无需额外动作。
+        """
+        _LOGGER.info(
+            "hxj_lock: %s 收到上锁请求, 但云锁通道无远程上锁接口 "
+            "(关门由门体机械回锁完成)", self._device_id)
 
     async def _async_cloud_open(self) -> None:
         try:

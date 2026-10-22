@@ -288,10 +288,23 @@ class HxjClient:
         with self._lock:
             try:
                 return self._tcp_request_locked(method, data, timeout)
-            except (HxjProtocolError, OSError):
-                # 连接可能已被服务端关闭: 重连授权后重试一次
+            except (HxjProtocolError, OSError) as err:
+                # 连接可能已被服务端关闭: 重连授权后重试一次。
+                # 注意: 只有"连接层"错误才重试 —— 若已经发出请求却没等到响应
+                # (例如等待超时), 重试会把开锁指令**再发一遍**。
+                if not self._is_connection_error(err):
+                    raise
                 self.tcp_connect()
                 return self._tcp_request_locked(method, data, timeout)
+
+    @staticmethod
+    def _is_connection_error(err: Exception) -> bool:
+        """判断错误是否为连接层问题 (可安全重试)"""
+        msg = str(err)
+        return ("连接被服务端关闭" in msg
+                or "TCP 连接失败" in msg
+                or "bad HSP mark" in msg
+                or isinstance(err, OSError))
 
     def _tcp_request_locked(self, method: str, data, timeout: int) -> dict:
         if self._sock is None:
@@ -311,7 +324,11 @@ class HxjClient:
         # 本请求对应的响应帧为止。否则会把推送帧误当成本次响应返回 —— 曾导致
         # appCloudDeviceList 被解析成 "0 台设备", 实体全部变 unavailable。
         # 推送帧单独收集起来, 供上层实时消费。
-        for _ in range(20):
+        #
+        # 跳过上限要给足: 新建连接时服务端会先补推约 20 条历史事件, 之前上限
+        # 只有 20 帧 -> 刚好越界就误判"未收到响应", 触发重试 (开锁指令会被
+        # 重发一遍, 而且用户要白等一个 timeout, 实测拖到 30 秒)。
+        for _ in range(300):
             if resp.get("method") == method:
                 break
             if resp.get("_serial") == serial and "resultCode" in resp:
@@ -349,11 +366,16 @@ class HxjClient:
 
     def listen_push(self, on_event, stop_event: threading.Event,
                     reconnect_delay: float = 3.0,
-                    max_lifetime: float = 20.0) -> None:
+                    max_lifetime: float = 15.0) -> None:
         """长连接监听服务端主动推送 (appCloudLockEventPush)。
 
         服务端会把门锁事件排队, 在客户端"下次鉴权"时才下发, 且空闲约 90s 会主动
         断开连接。因此这里每 max_lifetime 秒主动重连一次, 保证排队的事件能及时取走。
+
+        max_lifetime 就是**事件延迟的上限** (服务端只在你鉴权时才给你发):
+        实测 20s 时端到端延迟达 20~90 秒 (云端落库 20~70s + 等待鉴权 0~40s)。
+        但每次重连服务端都会补推约 20 条历史事件 (靠基线过滤丢弃), 周期越短
+        浪费越多 —— 15s 是延迟与噪音的平衡点。
 
         在独立线程中运行, 断线自动重连, 直到 stop_event 被置位。
         on_event 在监听线程中被调用, 调用方需自行切回事件循环。

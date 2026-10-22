@@ -16,10 +16,10 @@ custom_components/hxj_lock/
 ├── manifest.json        清单 (requirements 为空)
 ├── const.py             常量
 ├── config_flow.py       UI 配置流程 (账号/密码/极验令牌/reauth/选项)
-├── coordinator.py       数据协调器 (轮询 + 实时推送监听)
-├── lock.py              锁实体 (远程开锁)
-├── binary_sensor.py     在线状态
-├── sensor.py            最近事件
+├── coordinator.py       数据协调器 (轮询 + 实时推送监听 + 本地乐观事件 + 门状态推导)
+├── lock.py              锁实体 (远程开锁, 状态随门状态事件联动)
+├── binary_sensor.py     在线状态 + 门状态 (device_class=door)
+├── sensor.py            最近事件 + 门锁状态 (中文文字)
 ├── event.py             事件实体 (开门/关门/报警/低电量…)
 ├── image.py             门前抓拍图片实体
 ├── device_trigger.py    设备触发器 (自动化用"门锁事件"触发)
@@ -73,15 +73,21 @@ custom_components/hxj_lock/
 
 | 实体 | 类型 | 说明 |
 |---|---|---|
-| `lock.<设备名>` | lock | 显示 locked/unlocked; `unlock` 服务 = 远程开锁 |
+| `lock.<设备名>` | lock | 显示 locked/unlocked; `unlock` 服务 = 远程开锁; 属性含 `door_state` / `door_state_name` |
 | `binary_sensor.<设备名>_在线状态` | connectivity | deviceState==3 为在线; 属性含 rssi/MAC/版本 |
-| `sensor.<设备名>_最近事件` | sensor | 如 `2026-10-21 19:10:02 开门 钥匙:002`; 属性含最近 20 条事件 |
-| `event.<设备名>_事件` | event | 事件实体, 状态即最近一次事件类型 (open/close/alarm/…); 属性含 title/log_id/time/has_media |
+| `binary_sensor.<设备名>_门状态` | door | **门是开是关**: on=开 / off=关; 属性含 `state_name`(开/关) / `last_event` / `source` |
+| `sensor.<设备名>_门锁状态` | sensor | 门状态的中文文字: `开门` / `关门` / `未知`, 图标跟随 |
+| `sensor.<设备名>_最近事件` | sensor | 如 `2026-10-21 19:10:02 开门 钥匙:002`; 属性含最近 20 条事件 (每条带 `type` / `type_name`) |
+| `event.<设备名>_事件` | event | 事件实体; 属性含 `event_type`(open/close/…) / **`event_type_name`(开门/关门/…)** / `title` / `time` / `has_media` |
 | `image.<设备名>_门前抓拍` | image | 最近一次门口抓拍图; 状态为图片更新时间, 图片经 HA 图片代理加载 |
 
-注意: 云端协议不反馈门闩实际开/关状态, 锁实体默认显示 locked,
-执行开锁后 10 秒内显示 unlocked, 之后恢复。
-
+> **关于门状态**: 云端协议**不下发门闩状态** (设备列表里只有 `deviceState` 在线
+> 状态), 所以门状态是由**开门/关门事件推导**出来的:
+> - 收到"开门"事件 → 开; 收到"关门"事件 → 关;
+> - 云端"关门"事件上报极少 (实测 100 条日志里只有 4 条关门 vs 90 条开门),
+>   所以开门后若 180 秒仍没收到关门事件, 按"门体已机械回锁"处理, 自动置为关;
+> - HA 重启后门状态会从云端日志自动恢复, 不会一直是"未知"。
+>
 > **关于"远程上锁"**: 云锁通道 (`appCloudDeviceList`) 逆出的命令里只有
 > `appCloudOpenLock`, **没有远程上锁/关门接口** —— `appCloseDoorLock` 属于
 > 普通网关门锁通道, 与云锁无关。所以本集成只暴露 `LockEntityFeature.OPEN`,
@@ -94,15 +100,20 @@ custom_components/hxj_lock/
 
 | 通道 | 用途 | 延迟 |
 |---|---|---|
-| **事件实体** `event.<设备名>_事件` | 状态变为事件类型, 可用"事件"触发器写自动化 | 事件入云后 3~5 秒 |
-| **总线事件** `hxj_lock_event` | 载荷含 `device_id` / `event_type` / `title` / `log_id` / `time` / `has_media` | 同上 |
+| **事件实体** `event.<设备名>_事件` | 状态变为事件类型, 可用"事件"触发器写自动化 | **本机开锁 ~1 秒**; 他人开锁 20~90 秒 |
+| **总线事件** `hxj_lock_event` | 载荷含 `device_id` / `event_type` / `event_type_name` / `title` / `log_id` / `time` / `has_media` / `source` | 同上 |
 | **HA 持久通知** | 前端通知面板弹出"门锁事件 · 开门" (选项里可关) | 同上 |
 
-> 端到端延迟 = 设备上报到云端 (实测 10~70 秒) + 事件送达 (3~5 秒)。
-> 远程开锁的实测端到端为 **18 秒**。
+> **本机远程开锁的延迟已优化到 ~1 秒**: 云端把开门记录落库要 **20~70 秒**,
+> 而推送只在客户端"下次鉴权"时才下发 (服务端把事件排队) —— 等云端事件会有一段
+> 20~90 秒的"真空期"。现在开锁指令云端确认成功后**立即在本地产生事件**
+> (事件实体 / 总线事件 / 持久通知三路同时发出), 云端真实事件稍后到达时按
+> **时间窗 + keyName** 识别为"同一次开门"并**静默合并**, 不会重复通知。
+>
+> 设备侧用钥匙/指纹开门 (非本机触发) 则仍要等云端落库, 延迟 20~90 秒。
 
 事件来源是**服务端实时推送** `appCloudLockEventPush`: 集成在后台维持一条长连接,
-服务端把事件排队, 在客户端下次鉴权时下发 (空闲约 90s 会断, 集成每 20s 主动重连
+服务端把事件排队, 在客户端下次鉴权时下发 (空闲约 90s 会断, 集成每 15s 主动重连
 一次以尽快取走)。同时保留 `appCloudLockLogList` 轮询作为兜底, 两条路径按
 `logId` 去重, 同一事件只通知一次。
 
@@ -122,7 +133,7 @@ automation:
     action:
       - service: notify.wxpusher
         data:
-          title: 门锁事件
+          title: "门锁 · {{ trigger.event_type_name | default(trigger.type) }}"
           message: "{{ trigger.title }} @ {{ trigger.time }}"
 ```
 
@@ -133,8 +144,10 @@ automation:
 | `trigger.title` | 事件标题, 如 `开门 钥匙:18074736303` |
 | `trigger.time` | 事件发生时间, 如 `2026-10-22 12:41:54` |
 | `trigger.event_type` | `open` / `close` / `alarm` / `low_battery` / … |
+| `trigger.event_type_name` | **中文类型名**: `开门` / `关门` / `报警` / `低电量` / … |
 | `trigger.log_id` | 云端日志 id (可用来取抓拍) |
 | `trigger.has_media` | 该事件是否带抓拍/视频 |
+| `trigger.source` | `local` = 本机远程开锁 (立即产生) / `cloud` = 云端上报 |
 | `trigger.event.*` | 上面几项的子字典形式, 与 event 平台触发器一致 |
 | `trigger.device_id` / `trigger.type` | 触发器本身的信息 |
 
@@ -151,8 +164,11 @@ automation:
     action:
       - service: rest_command.wxpusher
         data:
-          title: 门锁事件
-          message: "{{ trigger.title }} @ {{ trigger.time }}"
+          title: "门锁 · {{ trigger.event_type_name | default(trigger.type) }}"
+          message: >-
+            {{ trigger.title | default(trigger.event_type_name) }}
+            @ {{ trigger.time }}
+            {%- if trigger.source == 'local' %} (HA 远程开锁){% endif %}
     mode: parallel
     max: 10
 ```
@@ -168,8 +184,8 @@ automation:
     action:
       - service: notify.wxpusher
         data:
-          title: "{{ trigger.event.data.title }}"
-          message: "{{ trigger.event.data.time }}"
+          title: "门锁 · {{ trigger.event.data.event_type_name }}"
+          message: "{{ trigger.event.data.title }} @ {{ trigger.event.data.time }}"
 ```
 
 ## 门前抓拍与门外视频
@@ -262,6 +278,10 @@ automation:
 | 集成一直 `not_loaded`, 日志报 `Unable to import component: No module named 'custom_components.hxj_lock.xxx'` | **`custom_components/` 下存在带 `manifest.json` 的备份目录** (如 `hxj_lock.bak`) | HA 会把每个子目录都当集成加载, 含点号的目录名不是合法 Python 包名 → 整个 domain 无法 setup, 条目永远 `not_loaded`。**把备份目录移出 `custom_components/`** (放 `/config/` 或别处) |
 | 实体突然全部 `unavailable` | 云端瞬时返回空设备列表 | 集成已做保护 (保留上次数据), 不会误判离线; 日志可见 `保留上次数据` |
 | 前端通知面板没有门锁通知 | 持久通知是内存态, HA 重启后清空 | 属预期行为; 要留痕请用 WxPusher 等通知服务 |
+| 门状态一直是"未知" | 云端不下发门闩状态, 且日志里没有任何开门/关门事件可推导 | 触发一次开门/关门即可; HA 重启后会自动从云端日志恢复 |
+| 门状态过一会儿自己从"开"变"关" | 云端"关门"事件上报极少, 开门后 180 秒仍无关门事件即按门体机械回锁处理 | 属预期行为; 关门事件到达时会立即变"关" |
+| 点开门后事件很快又来一次 | 本机开锁会先本地产生事件, 云端真实事件到达后按时间窗+keyName 识别为同一次并静默合并 | 属预期行为, 只会通知一次; 日志可见 `合并 (同一次开门)` |
+| 开门服务卡 30 秒 | 旧版协议跳过推送帧上限只有 20 帧, 新连接补推历史时刚好越界会误判"未收到响应"并重试 | 已修复 (上限 300 帧 + 只在连接层错误时重试), 现在实测 0.7~1.4 秒 |
 
 开启调试日志:
 

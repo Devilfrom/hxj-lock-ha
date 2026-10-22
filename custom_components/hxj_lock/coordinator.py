@@ -1,22 +1,26 @@
 """慧享家门锁数据协调器 — 轮询 + 服务端实时推送 双通道"""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
+import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.components.persistent_notification import async_create as pn_async_create
 
 from .const import (
     CONF_ACCOUNT, CONF_ANDROID_ID, CONF_DEVICE_NAME, CONF_LOG_COUNT,
     CONF_NOTIFY, CONF_SCAN_INTERVAL, CONF_TOKEN_ID, DEFAULT_LOG_COUNT,
-    DEFAULT_NOTIFY, DEFAULT_SCAN_INTERVAL, DEVICE_TYPE_CLOUD_LOCK, DOMAIN,
-    EVENT_FIRE_TYPE, EVENT_TYPES, GEETEST_HINT,
+    DEFAULT_NOTIFY, DEFAULT_SCAN_INTERVAL, DEVICE_TYPE_CLOUD_LOCK,
+    DOOR_STATE_FALLBACK, DOMAIN, EVENT_FIRE_TYPE, EVENT_TYPES, GEETEST_HINT,
+    LOCAL_EVENT_MERGE_WINDOW,
 )
 from .protocol import (
     HxjAuthError, HxjClient, HxjProtocolError, event_category, event_title, fmt_time,
@@ -61,6 +65,15 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         self._initialized = False
         # 门锁事件订阅者 (event 实体用它实时更新自身状态)
         self._event_sinks: list = []
+        # 本地乐观事件: 开锁指令云端确认后立即产生, 不等云端落库(要 20~70 秒)
+        # did -> [{"ts": 本地时间戳, "category": 事件类型}]
+        self._local_pending: dict[str, list] = {}
+        # 门状态 (由 open/close 事件推导): did -> {"state","ts","source","title"}
+        self._door_state: dict[str, dict] = {}
+        # 门状态兜底定时器: 开门后若一直没收到"关门"事件, 判定为已机械回锁
+        self._door_timer: dict[str, callable] = {}
+        # 门状态变化回调 (锁实体用它刷新状态)
+        self._door_sinks: list = []
         # 后台长连接 (实时推送)
         self._listener_client: HxjClient | None = None
         self._listener_stop = threading.Event()
@@ -141,21 +154,317 @@ class HxjLockCoordinator(DataUpdateCoordinator):
                         seen.pop(next(iter(seen)))
         if not self._initialized:
             self._initialized = True
-            return      # 首次刷新只建基线, 不把历史事件回放给 event 实体/通知
+            # 首次刷新只建基线, 不把历史事件回放给 event 实体/通知;
+            # 但门状态要从云端日志恢复 (否则 HA 重启后门状态一直是"未知")
+            self._restore_door_state(devices)
+            return
         for did, ev in new:
+            # 门状态由事件推导 (开门/关门)
+            self._apply_door_state(did, ev)
+            # 与本地乐观事件是同一次开门 -> 不重复通知
+            if self._is_duplicate_of_local(did, ev):
+                continue
             self._emit_event(did, ev)
+
+    def _restore_door_state(self, devices: dict) -> None:
+        """从云端日志恢复门状态 (HA 重启后不至于一直是"未知")。
+
+        取每台锁最近的一条开门/关门事件:
+          - 是开门事件, 且距今不超过 DOOR_STATE_FALLBACK -> 判为"开"
+          - 否则 -> "关"
+        """
+        now = int(time.time())
+        for did, dev in (devices or {}).items():
+            for ev in dev.get("events", []):
+                category = ev.get("category")
+                if category not in ("open", "close"):
+                    continue
+                ts = int(ev.get("ts") or 0)
+                if category == "open" and now - ts <= DOOR_STATE_FALLBACK:
+                    state = "open"
+                else:
+                    state = "closed"
+                self._door_state[did] = {
+                    "state": state,
+                    "ts": ts,
+                    "source": "restore",
+                    "title": ev.get("title"),
+                }
+                _LOGGER.info("hxj_lock: %s 门状态从云端日志恢复为 %s (%s)",
+                             did, state, ev.get("time"))
+                if state == "open":
+                    self._arm_door_fallback(did)
+                break
+
+    # ---------- 门状态 (由 open/close 事件推导) ----------
+    def _apply_door_state(self, did: str, ev: dict) -> None:
+        """根据开门/关门事件更新门状态。
+
+        云端协议**不下发门闩状态** (设备列表里只有 deviceState 在线状态), 且
+        "关门"事件上报极少 (实测 100 条日志里只有 4 条关门 vs 90 条开门),
+        所以门状态只能由事件推导:
+          - 收到 open  -> 开
+          - 收到 close -> 关
+          - 开门后 DOOR_STATE_FALLBACK 秒仍无关门事件 -> 视为已机械回锁, 置为关
+        """
+        category = ev.get("category")
+        ts = int(ev.get("ts") or time.time())
+        if category == "open":
+            state = "open"
+        elif category == "close":
+            state = "closed"
+        else:
+            return      # 其它类型不改变门状态
+        prev = self._door_state.get(did) or {}
+        changed = prev.get("state") != state
+        # 状态相同也要刷新元信息 (本地乐观事件 -> 云端真实事件, 谁新用谁)
+        self._door_state[did] = {
+            "state": state,
+            "ts": ts,
+            "source": ev.get("source", "cloud"),
+            "title": ev.get("title"),
+        }
+        if changed:
+            _LOGGER.info("hxj_lock: %s 门状态 -> %s (%s)", did, state,
+                         ev.get("title"))
+        self._notify_door_sinks(did)
+        # 兜底定时器只在**状态发生变化**时重新计时。
+        # 否则同一次开门会因"本地事件 / 云端推送 / 轮询"三条路径各 arm 一次,
+        # 定时器被不断推后, 永远等不到兜底回锁。
+        if not changed:
+            return
+        # 开门后启动兜底定时器: 云端关门事件缺失时, 到点判定为已回锁
+        if state == "open":
+            self._arm_door_fallback(did)
+        else:
+            self._cancel_door_fallback(did)
+
+    def _notify_door_sinks(self, did: str) -> None:
+        """通知门状态订阅者 (锁实体用它刷新状态)。
+
+        订阅者会写实体状态, 必须保证在事件循环线程执行。
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not self.hass.loop:
+            self.hass.loop.call_soon_threadsafe(self._notify_door_sinks, did)
+            return
+        for sink in list(self._door_sinks):
+            try:
+                sink(did)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("hxj_lock: 门状态订阅者回调异常")
+
+    def _safe_update_listeners(self) -> None:
+        """触发实体刷新, 并保证在事件循环线程执行。
+
+        HA 2026.6 的事件循环不在主线程, 而轮询刷新走 executor 线程,
+        所以任何写实体状态的动作都必须切回事件循环, 否则会报
+        "calls async_write_ha_state from a thread other than the event loop"。
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self.hass.loop:
+            self.async_update_listeners()
+        else:
+            self.hass.loop.call_soon_threadsafe(self.async_update_listeners)
+
+    def register_door_sink(self, sink) -> None:
+        if sink not in self._door_sinks:
+            self._door_sinks.append(sink)
+
+    def unregister_door_sink(self, sink) -> None:
+        if sink in self._door_sinks:
+            self._door_sinks.remove(sink)
+
+    def _arm_door_fallback(self, did: str) -> None:
+        """开门后启动兜底定时器 (关门事件缺失时按机械回锁处理)。
+
+        注意: HA 2026.6 的事件循环**不在主线程**跑, 所以不能用
+        "当前线程是不是主线程"来判断能否直接调度。async_call_later 内部是
+        `hass.loop.call_at(...)`, 从别的线程调用会让定时器在错误的线程上触发,
+        触发时 async_write_ha_state 会抛
+        "calls async_write_ha_state from a thread other than the event loop"。
+        这里统一用 hass.loop.call_soon_threadsafe 把动作切回事件循环再执行。
+        """
+        # async_call_later 内部是 hass.loop.call_at(), 必须在事件循环线程调用
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not self.hass.loop:
+            self.hass.loop.call_soon_threadsafe(self._arm_door_fallback, did)
+            return
+        self._cancel_door_fallback(did)
+
+        def _fire(*_args) -> None:
+            self._door_timer.pop(did, None)
+            # 定时器可能不在事件循环线程触发, 统一切回去
+            self.hass.loop.call_soon_threadsafe(self._do_door_fallback, did)
+
+        try:
+            self._door_timer[did] = async_call_later(
+                self.hass, DOOR_STATE_FALLBACK, _fire)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("hxj_lock: 门状态兜底定时器启动失败")
+
+    def _do_door_fallback(self, did: str) -> None:
+        """兜底回锁的实际处理 (确保在事件循环线程执行)"""
+        st = self._door_state.get(did) or {}
+        if st.get("state") != "open":
+            return
+        self._door_state[did] = {
+            **st, "state": "closed", "source": "fallback",
+        }
+        _LOGGER.info(
+            "hxj_lock: %s 开门后 %ds 未收到关门事件, 按机械回锁处理",
+            did, DOOR_STATE_FALLBACK)
+        self._notify_door_sinks(did)
+        self._safe_update_listeners()
+
+    def _cancel_door_fallback(self, did: str) -> None:
+        cancel = self._door_timer.pop(did, None)
+        if cancel is not None:
+            try:
+                cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _in_event_loop(self) -> bool:
+        """当前是否在 HA 事件循环线程里"""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        except Exception:  # noqa: BLE001
+            return True
+        return running is self.hass.loop
+
+    def get_door_state(self, did: str) -> dict:
+        """返回门状态: {"state": "open"/"closed"/"unknown", ...}"""
+        st = self._door_state.get(did)
+        if not st:
+            return {"state": "unknown", "ts": 0, "source": None, "title": None}
+        return st
+
+    # ---------- 本地乐观事件 (消除开锁后的延迟真空期) ----------
+    def _emit_local_open(self, did: str) -> None:
+        """开锁指令云端确认成功后, 立即本地产生一个"开门"事件。
+
+        背景: 云端把开门记录落库要 20~70 秒, 推送又只在"下次鉴权"时下发,
+        用户点开门后要等 20~90 秒才看到事件 —— 中间是一段"真空期"。
+        这里在指令返回的瞬间就先把事件发出去 (事件实体 / bus 事件 / 通知),
+        云端真实事件稍后到达时按时间窗合并, 不会重复通知。
+        """
+        now = int(time.time())
+        ev = {
+            "time": fmt_time(now),
+            "ts": now,
+            "title": "开门 钥匙:远程",
+            "logId": None,
+            "logType": 1,
+            "logInfoType": 0,
+            "keyName": "远程",
+            "category": "open",
+            "hasMedia": False,
+            "imageUrl": None,
+            "smallImageUrl": None,
+            "source": "local",
+        }
+        # 记下这次本地事件, 云端真实事件到达时用来识别"同一次开门"
+        self._local_pending.setdefault(did, []).append(
+            {"ts": now, "category": "open"})
+        _LOGGER.info("hxj_lock: %s 开锁指令已确认, 立即产生本地开门事件", did)
+        self._apply_door_state(did, ev)
+        self._write_back_event(did, ev)
+        self._emit_event(did, ev)
+
+    def _is_duplicate_of_local(self, did: str, ev: dict) -> bool:
+        """云端事件是否与本地乐观事件是"同一次开门"。
+
+        云端开门记录的落库延迟 20~70 秒, 落库后其 createTime 仍是开门那一刻
+        的时间, 所以按时间窗 + 事件类型判定即可。
+
+        还要校验 keyName: 远程开锁在云端的 keyName 就是**账号手机号**
+        (实测 "开门 钥匙:18074736303"), 而物理钥匙开门是 002/004 等编号。
+        这样就不会把"刚远程开锁后有人用钥匙开门"误判成同一次而漏掉通知。
+        """
+        pending = self._local_pending.get(did)
+        if not pending:
+            return False
+        ts = int(ev.get("ts") or 0)
+        category = ev.get("category")
+        key_name = ev.get("keyName")
+        # 只合并"由本账号远程开锁"产生的那条云端记录
+        if self.account and key_name and key_name != self.account:
+            return False
+        for item in list(pending):
+            if item["category"] != category:
+                continue
+            if abs(ts - item["ts"]) <= LOCAL_EVENT_MERGE_WINDOW:
+                pending.remove(item)
+                if not pending:
+                    self._local_pending.pop(did, None)
+                # 把云端 logId 也记入已见集合, 否则轮询路径会把它当成新事件
+                # 再触发一次通知 (推送路径命中合并时不会走到下面的 _seen 登记)
+                lid = ev.get("logId")
+                if lid:
+                    seen = self._seen.setdefault(did, {})
+                    seen[lid] = True
+                    if len(seen) > 500:
+                        seen.pop(next(iter(seen)))
+                _LOGGER.info(
+                    "hxj_lock: %s 云端事件与本地乐观事件合并 (同一次开门), 不重复通知",
+                    did)
+                return True
+        return False
+
+    def _write_back_event(self, did: str, ev: dict) -> None:
+        """把事件写回 coordinator.data, 让"最近事件"等实体立刻反映最新事件"""
+        dev = (self.data or {}).get(did)
+        if dev is None:
+            return
+        events = dev.setdefault("events", [])
+        # 同一次开门 (本地乐观事件 + 云端真实事件) 只保留一条
+        if ev.get("logId"):
+            events[:] = [e for e in events
+                         if not (e.get("logId") is None
+                                 and e.get("category") == ev.get("category")
+                                 and abs(int(e.get("ts") or 0)
+                                         - int(ev.get("ts") or 0))
+                                 <= LOCAL_EVENT_MERGE_WINDOW)]
+        events.insert(0, ev)
+        del events[20:]
+        if ev.get("imageUrl"):
+            # 新的门前抓拍: 更新快照
+            dev["snapshot"] = {
+                "log_id": ev.get("logId"),
+                "time": ev.get("time"),
+                "ts": ev.get("ts"),
+                "title": ev.get("title"),
+                "image_url": ev.get("imageUrl"),
+                "thumb_url": ev.get("smallImageUrl"),
+            }
+        self._safe_update_listeners()
 
     def _emit_event(self, did: str, ev: dict) -> None:
         """门锁事件统一分发: 事件实体 + bus 事件 + 持久通知"""
         category = ev.get("category") or "other"
+        meta = EVENT_TYPES.get(category, EVENT_TYPES["other"])
         payload = {
             "device_id": did,
             "event_type": category,
+            "event_type_name": meta.get("name"),
             "title": ev.get("title"),
             "log_id": ev.get("logId"),
             "time": ev.get("time"),
             "has_media": ev.get("hasMedia"),
             "image_url": ev.get("imageUrl"),
+            "source": ev.get("source", "cloud"),
         }
         for sink in list(self._event_sinks):
             try:
@@ -352,22 +661,12 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         if ts > self._newest_ts.get(did, 0):
             self._newest_ts[did] = ts
         # 同步写回 coordinator.data, 让"最近事件"等实体立刻反映最新事件
-        dev = (self.data or {}).get(did)
-        if dev is not None:
-            events = dev.setdefault("events", [])
-            events.insert(0, ev)
-            del events[20:]
-            if ev.get("imageUrl"):
-                # 新的门前抓拍: 更新快照
-                dev["snapshot"] = {
-                    "log_id": ev.get("logId"),
-                    "time": ev.get("time"),
-                    "ts": ev.get("ts"),
-                    "title": ev.get("title"),
-                    "image_url": ev.get("imageUrl"),
-                    "thumb_url": ev.get("smallImageUrl"),
-                }
-            self.async_update_listeners()
+        self._write_back_event(did, ev)
+        # 门状态由事件推导
+        self._apply_door_state(did, ev)
+        # 与本地乐观事件是同一次开门 -> 不重复通知 (但属性仍会更新)
+        if self._is_duplicate_of_local(did, ev):
+            return
         self._emit_event(did, ev)
 
     # ---------- 门前抓拍 ----------
@@ -424,6 +723,11 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         for did in targets:
             results[did] = await self.hass.async_add_executor_job(
                 self._open_lock_blocking, did)
+            # 云端已确认开锁 -> 立即本地产生开门事件, 不等云端落库
+            # (落库要 20~70 秒, 否则用户点开门后有 10 秒以上的延迟真空期)
+            resp = results.get(did) or {}
+            if resp.get("resultCode") == 0:
+                self._emit_local_open(did)
         return results
 
     def _open_lock_blocking(self, device_id: str) -> dict:
