@@ -88,17 +88,19 @@ custom_components/hxj_lock/
 
 ## 门锁事件通知
 
-开门 / 关门 / 报警 / 低电量 / 新增删除用户 / 门前抓拍等事件会**同时**走三条通道
-(实测从开锁到送达约 3~5 秒):
+开门 / 关门 / 报警 / 低电量 / 新增删除用户 / 门前抓拍等事件会**同时**走三条通道:
 
-| 通道 | 用途 |
-|---|---|
-| **事件实体** `event.<设备名>_事件` | 状态变为事件类型, 可用"事件"触发器写自动化 |
-| **总线事件** `hxj_lock_event` | 载荷含 `device_id` / `event_type` / `title` / `log_id` / `time` / `has_media` |
-| **HA 持久通知** | 前端通知面板弹出"门锁事件 · 开门" (选项里可关) |
+| 通道 | 用途 | 延迟 |
+|---|---|---|
+| **事件实体** `event.<设备名>_事件` | 状态变为事件类型, 可用"事件"触发器写自动化 | 事件入云后 3~5 秒 |
+| **总线事件** `hxj_lock_event` | 载荷含 `device_id` / `event_type` / `title` / `log_id` / `time` / `has_media` | 同上 |
+| **HA 持久通知** | 前端通知面板弹出"门锁事件 · 开门" (选项里可关) | 同上 |
+
+> 端到端延迟 = 设备上报到云端 (实测 10~70 秒) + 事件送达 (3~5 秒)。
+> 远程开锁的实测端到端为 **18 秒**。
 
 事件来源是**服务端实时推送** `appCloudLockEventPush`: 集成在后台维持一条长连接,
-服务端把事件排队, 在客户端下次鉴权时下发 (空闲约 90s 会断, 集成每 45s 主动重连
+服务端把事件排队, 在客户端下次鉴权时下发 (空闲约 90s 会断, 集成每 20s 主动重连
 一次以尽快取走)。同时保留 `appCloudLockLogList` 轮询作为兜底, 两条路径按
 `logId` 去重, 同一事件只通知一次。
 
@@ -119,7 +121,38 @@ automation:
       - service: notify.wxpusher
         data:
           title: 门锁事件
-          message: "{{ trigger.event.title }}"
+          message: "{{ trigger.title }} @ {{ trigger.time }}"
+```
+
+设备触发器可用变量 (已按 HA 标准触发器范式构造 `trigger` 字典):
+
+| 变量 | 含义 |
+|---|---|
+| `trigger.title` | 事件标题, 如 `开门 钥匙:18074736303` |
+| `trigger.time` | 事件发生时间, 如 `2026-10-22 12:41:54` |
+| `trigger.event_type` | `open` / `close` / `alarm` / `low_battery` / … |
+| `trigger.log_id` | 云端日志 id (可用来取抓拍) |
+| `trigger.has_media` | 该事件是否带抓拍/视频 |
+| `trigger.event.*` | 上面几项的子字典形式, 与 event 平台触发器一致 |
+| `trigger.device_id` / `trigger.type` | 触发器本身的信息 |
+
+用 WxPusher 推微信 (HA 里配好 `rest_command.wxpusher` 后):
+
+```yaml
+automation:
+  - alias: 门锁事件推微信
+    trigger:
+      - platform: device
+        domain: hxj_lock
+        device_id: <设备ID>
+        type: open
+    action:
+      - service: rest_command.wxpusher
+        data:
+          title: 门锁事件
+          message: "{{ trigger.title }} @ {{ trigger.time }}"
+    mode: parallel
+    max: 10
 ```
 
 用事件实体:
@@ -189,6 +222,23 @@ logger:
   logs:
     custom_components.hxj_lock: debug
 ```
+
+## HA 版本兼容性
+
+本集成在 **HA 2026.6.2** 上开发验证。新版 HA 改了几个底层 API, 旧版 HA 也能跑
+(代码里做了兼容), 但如果你要在 2026.6+ 上二次开发, 注意这几处:
+
+| API | 2026.6 的变化 | 本集成的做法 |
+|---|---|---|
+| `EventEntity` | `async_fire_event(dict)` 已删除, 只能用 `_trigger_event(event_type, attrs)` | 用 `_trigger_event`, 并校验 event_type 在允许列表内 |
+| `LockEntityFeature` | **只剩 `OPEN`**, `LOCK` / `UNLOCK` 枚举被移除 | 只声明 `OPEN`; 另覆写 `async_unlock` 兼容, `async_lock` 给明确报错 |
+| `HomeAssistant.helpers` | 已移除, 不能用 `self.hass.helpers.event.async_call_later` | 改用模块级 `homeassistant.helpers.event.async_call_later(hass, delay, action)` |
+| `persistent_notification.async_create` | 是**同步 `@callback`** (返回 None) | 直接调用, 不要包 `async_create_task` |
+| `device_trigger.async_validate_trigger_config` | 签名多了 `hass` 参数 | 写成同时接受 `(hass, config)` 与 `(config)` |
+
+> ⚠️ `device_trigger` 的回调签名写错会让**整个 automation 域 setup 失败**
+> (所有自动化都变 unavailable), 排查时先看日志里有没有
+> `Setup failed for 'automation': Invalid config`。
 
 ## 与独立脚本的关系
 
