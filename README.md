@@ -30,6 +30,15 @@ custom_components/hxj_lock/
 
 ## 安装
 
+### 方式一：HACS（推荐）
+
+1. HACS → 右上角菜单 → **自定义仓库 (Custom repositories)**
+2. 仓库地址填 `https://github.com/Devilfrom/hxj-lock-ha`，类别选 `Integration`
+3. 在 HACS 里搜索并安装 **慧享家门锁**，装完重启 HA
+4. 设置 → 设备与服务 → 添加集成 → 搜索 "慧享家门锁"
+
+### 方式二：手动复制
+
 1. 把 `custom_components` 目录整个复制到 HA 配置目录:
    - HA OS / Container: `/config/custom_components/`
    - 结果: `/config/custom_components/hxj_lock/__init__.py` 存在
