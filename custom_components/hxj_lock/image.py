@@ -82,6 +82,7 @@ class HxjLockImage(CoordinatorEntity, ImageEntity):
             "event_time": snap.get("time"),
             "image_url": snap.get("image_url"),
             "thumb_url": snap.get("thumb_url"),
+            "note": "抓拍图仅来自门铃/报警/猫眼类事件 (云端只有这类记录带图), 普通开门不生成抓拍",
         }
 
     @callback
