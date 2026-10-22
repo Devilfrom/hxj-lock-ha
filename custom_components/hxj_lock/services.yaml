@@ -1,0 +1,21 @@
+set_token:
+  name: 更新登录令牌
+  description: 填入 geetest_login.py 获得的新 tokenId（令牌失效时用）。
+  fields:
+    token_id:
+      name: tokenId
+      description: 慧享家登录令牌
+      required: true
+
+open_lock:
+  name: 远程开锁
+  description: 对指定云锁执行远程开锁（appCloudOpenLock）。留空 device_id 则开所有已发现的锁。
+  fields:
+    device_id:
+      name: 设备 ID
+      description: 云锁 deviceId，留空 = 全部
+      required: false
+
+refresh:
+  name: 立即刷新
+  description: 立即向服务器拉取一次最新数据。

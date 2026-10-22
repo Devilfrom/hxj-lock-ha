@@ -1,0 +1,12 @@
+{
+  "domain": "hxj_lock",
+  "name": "慧享家智能门锁",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["custom_components.hxj_lock"],
+  "requirements": [],
+  "version": "1.0.0"
+}

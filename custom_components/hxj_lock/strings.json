@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "慧享家门锁登录",
+        "description": "填写慧享家 App 账号。若留空密码/令牌，将尝试直接用密码登录（服务器要求过极验验证码时会引导你粘贴令牌）。"
+      },
+      "paste_token": {
+        "title": "粘贴极验登录令牌",
+        "description": "{hint}"
+      },
+      "reauth_confirm": {
+        "title": "重新登录慧享家",
+        "description": "登录令牌已失效。{hint}"
+      }
+    },
+    "error": {
+      "invalid_auth": "账号/密码/令牌无效",
+      "cannot_connect": "无法连接慧享家服务器",
+      "no_devices": "账号下没有云锁设备（AppCloudDeviceList 为空）",
+      "name_mismatch": "没有找到指定名称的设备，账号下现有: {reason}"
+    },
+    "abort": {
+      "reauth_successful": "重新登录成功",
+      "already_configured": "该账号已配置"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "慧享家门锁选项",
+        "data": {
+          "scan_interval": "轮询间隔（秒，60-3600）",
+          "log_count": "拉取的日志条数（1-50）",
+          "device_name": "设备名筛选（留空 = 全部云锁）"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_token": {
+      "name": "更新登录令牌",
+      "description": "填入 geetest_login.py 获得的新 tokenId（令牌失效时用）",
+      "fields": {
+        "token_id": {
+          "name": "tokenId",
+          "description": "慧享家登录令牌",
+          "required": true
+        }
+      }
+    },
+    "open_lock": {
+      "name": "远程开锁",
+      "description": "对指定云锁执行远程开锁（appCloudOpenLock）",
+      "fields": {
+        "device_id": {
+          "name": "设备 ID",
+          "description": "留空 = 开所有已发现的锁",
+          "required": false
+        }
+      }
+    },
+    "refresh": {
+      "name": "立即刷新",
+      "description": "立即向服务器拉取一次最新数据"
+    }
+  }
+}
