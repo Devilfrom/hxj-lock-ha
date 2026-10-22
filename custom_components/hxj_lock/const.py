@@ -22,7 +22,8 @@ DEFAULT_LOG_COUNT = 5
 DEFAULT_NOTIFY = True
 DEVICE_TYPE_CLOUD_LOCK = 2       # appCloudOpenLock/appCloudLockLogList 固定 deviceType=2
 
-PLATFORMS = [Platform.LOCK, Platform.BINARY_SENSOR, Platform.SENSOR, Platform.EVENT]
+PLATFORMS = [Platform.LOCK, Platform.BINARY_SENSOR, Platform.SENSOR,
+             Platform.EVENT, Platform.IMAGE]
 
 # 门锁事件 -> HA event 子类型 / device_trigger subtype
 # (logType, logInfoType) 分类见 protocol.event_category
@@ -43,6 +44,7 @@ EVENT_TYPES = {
 SERVICE_SET_TOKEN = "set_token"
 SERVICE_OPEN_LOCK = "open_lock"
 SERVICE_REFRESH = "refresh"
+SERVICE_GET_SNAPSHOT = "get_snapshot"   # 取最近一次门前抓拍
 
 # token 失效时的提示 (极验人机结合登录)
 GEETEST_HINT = (

@@ -31,7 +31,7 @@
         "title": "慧享家门锁选项",
         "data": {
           "scan_interval": "轮询间隔（秒，60-3600）",
-          "log_count": "拉取的日志条数（1-50）",
+          "log_count": "拉取的日志条数（1-200，窗口越大越容易回溯到历史门前抓拍）",
           "device_name": "设备名筛选（留空 = 全部云锁）",
           "notify": "门锁事件推送通知（开门/关门/报警/低电量等发生时弹 HA 通知）"
         }
@@ -64,6 +64,17 @@
     "refresh": {
       "name": "立即刷新",
       "description": "立即向服务器拉取一次最新数据"
+    },
+    "get_snapshot": {
+      "name": "获取门前抓拍",
+      "description": "返回指定云锁（或全部）最近一次门前抓拍的信息，含图片地址",
+      "fields": {
+        "device_id": {
+          "name": "设备 ID",
+          "description": "留空 = 全部云锁",
+          "required": false
+        }
+      }
     }
   }
 }

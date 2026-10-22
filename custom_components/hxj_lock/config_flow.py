@@ -233,7 +233,8 @@ class HxjLockOptionsFlow(config_entries.OptionsFlow):
                 vol.All(int, vol.Range(min=60, max=3600)),
             vol.Optional(CONF_LOG_COUNT, default=int(self.entry.options.get(
                 CONF_LOG_COUNT, DEFAULT_LOG_COUNT))):
-                vol.All(int, vol.Range(min=1, max=50)),
+                # 上限放宽: 窗口越大越容易回溯到最近一次门前抓拍(抓拍事件很稀疏)
+                vol.All(int, vol.Range(min=1, max=200)),
             vol.Optional(CONF_DEVICE_NAME, default=self.entry.options.get(
                 CONF_DEVICE_NAME, self.entry.data.get(CONF_DEVICE_NAME, ""))): str,
             vol.Optional(CONF_NOTIFY, default=bool(self.entry.options.get(

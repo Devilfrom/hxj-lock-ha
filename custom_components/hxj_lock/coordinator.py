@@ -155,6 +155,7 @@ class HxjLockCoordinator(DataUpdateCoordinator):
             "log_id": ev.get("logId"),
             "time": ev.get("time"),
             "has_media": ev.get("hasMedia"),
+            "image_url": ev.get("imageUrl"),
         }
         for sink in list(self._event_sinks):
             try:
@@ -169,11 +170,15 @@ class HxjLockCoordinator(DataUpdateCoordinator):
         self.hass.bus.async_fire(EVENT_FIRE_TYPE, payload)
         if not self.notify_enabled:
             return
+        message = f"{payload.get('title')}（{payload.get('time')}）"
+        if payload.get("image_url"):
+            # 门前抓拍: 把图片地址一并带出来, 点开通知即可看图
+            message += f"\n抓拍: {payload['image_url']}"
         # 注意: persistent_notification.async_create 是 @callback 同步函数 (返回 None),
         # 不能用 async_create_task 包一层, 否则会抛 "A valid coroutine must be provided"
         pn_async_create(
             self.hass,
-            message=f"{payload.get('title')}（{payload.get('time')}）",
+            message=message,
             title=f"门锁事件 · {meta['name']}",
             notification_id=_safe_notification_id(
                 payload.get("device_id"), payload.get("log_id")),
@@ -209,9 +214,33 @@ class HxjLockCoordinator(DataUpdateCoordinator):
                     "keyName": r.get("keyName"),
                     "category": event_category(r),
                     "hasMedia": bool(r.get("mediaState") or r.get("videoState")),
+                    "imageUrl": r.get("imageUrl"),
+                    "smallImageUrl": r.get("smallImageUrl"),
                 } for r in logs]
                 events.sort(key=lambda x: x.get("ts") or 0, reverse=True)
-                devices[did] = {"info": d, "events": events,
+                # 最近一次带门前抓拍图的记录 (events 已按时间倒序)
+                snapshot = None
+                for ev in events:
+                    if ev.get("imageUrl"):
+                        snapshot = {
+                            "log_id": ev.get("logId"),
+                            "time": ev.get("time"),
+                            "ts": ev.get("ts"),
+                            "title": ev.get("title"),
+                            "image_url": ev.get("imageUrl"),
+                            "thumb_url": ev.get("smallImageUrl"),
+                        }
+                        break
+                if snapshot is None:
+                    # 本次拉取的窗口里没有带媒体的记录(抓拍/门口事件本来就稀疏),
+                    # 保留上一次的快照, 免得旧抓拍被后续几条开门记录顶掉
+                    snapshot = (self.data or {}).get(did, {}).get("snapshot")
+                    if snapshot is None:
+                        # 还没有过快照: 再深扫一次(200 条)找最近一次门前抓拍。
+                        # 只在首次遇到时做这一次, 与事件窗口大小解耦 ——
+                        # 否则窗口一小(重启/改选项)抓拍图就空了。
+                        snapshot = self._fetch_snapshot_deep(client, did)
+                devices[did] = {"info": d, "events": events, "snapshot": snapshot,
                                 "log_sum": log_data.get("listSum")}
             if not devices:
                 if name_filter and devices_raw:
@@ -315,6 +344,8 @@ class HxjLockCoordinator(DataUpdateCoordinator):
             "keyName": data.get("keyName"),
             "category": event_category(data),
             "hasMedia": bool(data.get("mediaState") or data.get("videoState")),
+            "imageUrl": data.get("imageUrl"),
+            "smallImageUrl": data.get("smallImageUrl"),
         }
         _LOGGER.info("hxj_lock: 收到实时推送事件 %s / %s",
                      ev.get("title"), ev.get("time"))
@@ -326,8 +357,62 @@ class HxjLockCoordinator(DataUpdateCoordinator):
             events = dev.setdefault("events", [])
             events.insert(0, ev)
             del events[20:]
+            if ev.get("imageUrl"):
+                # 新的门前抓拍: 更新快照
+                dev["snapshot"] = {
+                    "log_id": ev.get("logId"),
+                    "time": ev.get("time"),
+                    "ts": ev.get("ts"),
+                    "title": ev.get("title"),
+                    "image_url": ev.get("imageUrl"),
+                    "thumb_url": ev.get("smallImageUrl"),
+                }
             self.async_update_listeners()
         self._emit_event(did, ev)
+
+    # ---------- 门前抓拍 ----------
+    @staticmethod
+    def _fetch_snapshot_deep(client: HxjClient, device_id: str) -> dict | None:
+        """深扫日志窗口, 找最近一条带门前抓拍图的记录 (仅在还没有快照时调用一次)"""
+        try:
+            resp = client.cloud_lock_log(device_id, 0, 200, DEVICE_TYPE_CLOUD_LOCK)
+        except (HxjProtocolError, HxjAuthError):
+            return None
+        logs = (resp.get("data") or {}).get("list") or []
+        media = [r for r in logs if r.get("imageUrl")]
+        if not media:
+            return None
+        row = max(media, key=lambda x: x.get("createTime") or 0)
+        return {
+            "log_id": row.get("logId"),
+            "time": fmt_time(row.get("createTime")),
+            "ts": row.get("createTime"),
+            "title": event_title(row),
+            "image_url": row.get("imageUrl"),
+            "thumb_url": row.get("smallImageUrl"),
+        }
+
+    async def async_get_snapshot(self, device_id: str | None = None) -> dict:
+        """返回最近一次门前抓拍信息 (含图片地址)
+
+        注意: HA 的 REST 服务调用端点固定返回 [], 服务返回值要通过
+        WebSocket call_service(return_response=True) 或自动化里的
+        response_variable 变量才能拿到。
+        """
+        devices = self.data or {}
+        if device_id:
+            dev = devices.get(device_id)
+            if dev is None:
+                raise UpdateFailed(f"未找到设备 {device_id}")
+            return dev.get("snapshot") or {}
+        snaps = {}
+        for did, dev in devices.items():
+            snap = dev.get("snapshot")
+            if snap:
+                snaps[did] = {**snap, "device_id": did}
+        if len(snaps) == 1:
+            return next(iter(snaps.values()))
+        return snaps
 
     # ---------- 远程开锁 ----------
     async def async_open_lock(self, device_id: str | None = None) -> dict:

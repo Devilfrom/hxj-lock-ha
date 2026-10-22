@@ -6,11 +6,11 @@ import logging
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
 
 from .const import (
-    CONF_TOKEN_ID, DOMAIN, PLATFORMS, SERVICE_OPEN_LOCK, SERVICE_REFRESH,
-    SERVICE_SET_TOKEN,
+    CONF_TOKEN_ID, DOMAIN, PLATFORMS, SERVICE_GET_SNAPSHOT, SERVICE_OPEN_LOCK,
+    SERVICE_REFRESH, SERVICE_SET_TOKEN,
 )
 from .coordinator import HxjLockCoordinator
 
@@ -86,6 +86,14 @@ def _register_services(hass: HomeAssistant) -> None:
         for coordinator in list(hass.data.get(DOMAIN, {}).values()):
             await coordinator.async_request_refresh()
 
+    async def _handle_get_snapshot(call: ServiceCall) -> dict:
+        """返回最近一次门前抓拍信息 (含图片地址), 供自动化使用"""
+        device_id = call.data.get("device_id")
+        result: dict = {}
+        for coordinator in list(hass.data.get(DOMAIN, {}).values()):
+            result.update(await coordinator.async_get_snapshot(device_id))
+        return result
+
     hass.services.async_register(
         DOMAIN, SERVICE_SET_TOKEN, _handle_set_token,
         schema=SET_TOKEN_SCHEMA)
@@ -95,3 +103,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
     hass.services.async_register(
         DOMAIN, SERVICE_REFRESH, _handle_refresh)
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_GET_SNAPSHOT, _handle_get_snapshot,
+        supports_response=SupportsResponse.OPTIONAL)

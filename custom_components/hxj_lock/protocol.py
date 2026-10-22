@@ -404,6 +404,10 @@ class HxjClient:
     def cloud_lock_media(self, log_id: str) -> dict:
         return self.tcp_request("appCloudLockMediaLogInfo", {"logId": log_id})
 
+    def cloud_log_image(self, log_id: str) -> dict:
+        """按 logId 取抓拍图地址 (appCloudLogImage, 请求参数只有 logId)"""
+        return self.tcp_request("appCloudLogImage", {"logId": log_id})
+
     def close(self):
         if self._sock:
             try:

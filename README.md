@@ -21,6 +21,7 @@ custom_components/hxj_lock/
 ├── binary_sensor.py     在线状态
 ├── sensor.py            最近事件
 ├── event.py             事件实体 (开门/关门/报警/低电量…)
+├── image.py             门前抓拍图片实体
 ├── device_trigger.py    设备触发器 (自动化用"门锁事件"触发)
 ├── protocol.py          协议客户端 (HSP 帧 + DES-CBC + HMAC 签名)
 ├── hxj_crypto.py        纯 Python 单 DES / RSA
@@ -74,8 +75,9 @@ custom_components/hxj_lock/
 |---|---|---|
 | `lock.<设备名>` | lock | 显示 locked/unlocked; `unlock` 服务 = 远程开锁 |
 | `binary_sensor.<设备名>_在线状态` | connectivity | deviceState==3 为在线; 属性含 rssi/MAC/版本 |
-| `sensor.<设备名>_最近事件` | sensor | 如 `2026-10-21 19:10:02 开门 钥匙:002`; 属性含最近 N 条事件 |
+| `sensor.<设备名>_最近事件` | sensor | 如 `2026-10-21 19:10:02 开门 钥匙:002`; 属性含最近 20 条事件 |
 | `event.<设备名>_事件` | event | 事件实体, 状态即最近一次事件类型 (open/close/alarm/…); 属性含 title/log_id/time/has_media |
+| `image.<设备名>_门前抓拍` | image | 最近一次门口抓拍图; 状态为图片更新时间, 图片经 HA 图片代理加载 |
 
 注意: 云端协议不反馈门闩实际开/关状态, 锁实体默认显示 locked,
 执行开锁后 10 秒内显示 unlocked, 之后恢复。
@@ -170,6 +172,39 @@ automation:
           message: "{{ trigger.event.data.time }}"
 ```
 
+## 门前抓拍与门外视频
+
+### 抓拍图（已实现）
+
+云锁的门口抓拍图地址**直接写在开门记录里**（`logType=3` 抓拍事件、`logType=4` 且
+`logInfoType=15` 的视频事件会带 `imageUrl` / `smallImageUrl`），是
+`file.hxjiot.com` 上的公网 JPEG。本集成据此做了两件事:
+
+- **`image.<设备名>_门前抓拍` 实体** —— 显示最近一次抓拍图。图片经 HA 自己的图片代理
+  (`/api/image_proxy/...`) 加载，所以云端地址不必对浏览器公网可达。
+- **`hxj_lock.get_snapshot` 服务** —— 拿图片地址去推微信、做自动化。
+
+抓拍图的查找与事件窗口解耦：窗口（选项里的"日志条数"）里没有带媒体的记录时，集成
+会**额外深扫一次 200 条**去找最近一次抓拍（只在首次遇到时做），所以重启或调小窗口
+都不会让抓拍图消失。
+
+### 门外视频（未实现，说明原因）
+
+`appCloudLockMediaLogInfo` 能取到视频，但拿到的是**加密的私有流**:
+
+| 字段 | 实测值 |
+|---|---|
+| `mediaUrl` | `https://oss.hxjiot.com/lockUpload/XXXX.mjif` |
+| `mediaSecret` | 128 位 hex 串（每条视频不同） |
+| `mediaOffset` | 异或密钥偏移（如 1074） |
+
+App 下载后用 `MediaUtils.hxXorCipherMedia(content, mediaSecret, mediaOffset)` 解密，
+再用自研 `VideoCodec` + `MediaCodec` 播放 —— `.mjif` 是私有容器格式，没有通用解码器。
+
+要在 HA 里实现需要: ① 复刻 XOR 解密; ② 逆向 `.mjif` 容器与视频编码; ③ 转换成
+HA camera 能吃的流 (HLS/fMP4)。工程量大且容错脆弱，因此本集成**只做抓拍图**。
+如果确实需要视频，建议单独用 ffmpeg 拉流转封装，或直接用慧享家 App 看。
+
 ## 服务
 
 | 服务 | 用途 |
@@ -177,6 +212,19 @@ automation:
 | `hxj_lock.set_token` | 更新 tokenId (字段 token_id), 自动重载集成 |
 | `hxj_lock.open_lock` | 远程开锁; 可传 device_id, 留空 = 所有锁 |
 | `hxj_lock.refresh` | 立即刷新数据 |
+| `hxj_lock.get_snapshot` | 返回最近一次门前抓拍信息 (含图片地址) |
+
+> `get_snapshot` 的返回值要通过 **WebSocket `call_service` (`return_response: true`)**
+> 或自动化里的 `response_variable` 变量取 —— HA 的 REST 服务调用端点固定返回 `[]`。
+
+```yaml
+- service: hxj_lock.get_snapshot
+  response_variable: snap
+- service: rest_command.wxpusher
+  data:
+    title: 门口抓拍
+    message: "{{ snap.time }} {{ snap.title }} {{ snap.image_url }}"
+```
 
 HA 自动化里远程开锁示例:
 
@@ -199,7 +247,7 @@ automation:
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | 轮询间隔 (秒) | 300 | 轮询兜底间隔; 实时推送不受它影响 |
-| 日志条数 | 5 | 每次拉取的开门记录条数 |
+| 日志条数 | 5 | 每次拉取的开门记录条数 (1-200)。窗口越大越容易回溯到历史门前抓拍 |
 | 设备名筛选 | 空 | 留空 = 账号下全部云锁; 填设备名 = 只匹配该锁 |
 | 事件通知 | 开 | 关掉后不再弹 HA 持久通知 (事件实体与总线事件仍照发) |
 

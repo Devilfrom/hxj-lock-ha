@@ -68,12 +68,17 @@ class HxjLastEventSensor(CoordinatorEntity, SensorEntity):
     def extra_state_attributes(self) -> dict:
         dev = (self.coordinator.data or {}).get(self._device_id, {})
         events = dev.get("events", [])
+        snap = dev.get("snapshot") or {}
         return {
             "device_id": self._device_id,
+            # 只暴露最近若干条, 避免 log_count 调大后属性过大
             "events": [
                 {"time": e["time"], "title": e["title"],
                  "logId": e.get("logId"), "hasMedia": e.get("hasMedia")}
-                for e in events
+                for e in events[:20]
             ],
+            "events_shown": min(len(events), 20),
             "event_total_hint": dev.get("log_sum"),
+            "snapshot_time": snap.get("time"),
+            "snapshot_image_url": snap.get("image_url"),
         }
