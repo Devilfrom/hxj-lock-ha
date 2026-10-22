@@ -12,8 +12,9 @@ from homeassistant.core import callback
 
 from .const import (
     CONF_ACCOUNT, CONF_ANDROID_ID, CONF_DEVICE_NAME, CONF_LOG_COUNT,
-    CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_TOKEN_ID, DEFAULT_LOG_COUNT,
-    DEFAULT_SCAN_INTERVAL, DOMAIN, GEETEST_HINT, TITLE,
+    CONF_NOTIFY, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_TOKEN_ID,
+    DEFAULT_LOG_COUNT, DEFAULT_NOTIFY, DEFAULT_SCAN_INTERVAL, DOMAIN,
+    GEETEST_HINT, TITLE,
 )
 from .protocol import HxjAuthError, HxjClient, HxjProtocolError
 
@@ -235,5 +236,7 @@ class HxjLockOptionsFlow(config_entries.OptionsFlow):
                 vol.All(int, vol.Range(min=1, max=50)),
             vol.Optional(CONF_DEVICE_NAME, default=self.entry.options.get(
                 CONF_DEVICE_NAME, self.entry.data.get(CONF_DEVICE_NAME, ""))): str,
+            vol.Optional(CONF_NOTIFY, default=bool(self.entry.options.get(
+                CONF_NOTIFY, DEFAULT_NOTIFY))): bool,
         })
         return self.async_show_form(step_id="init", data_schema=schema)

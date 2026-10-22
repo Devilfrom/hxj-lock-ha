@@ -32,6 +32,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # 后台长连接: 实时接收服务端推送的门锁事件 (appCloudLockEventPush)
+    # 放在平台就绪之后启动, 保证 event 实体已订阅, 不会漏掉事件
+    coordinator.start_push_listener()
+
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     _register_services(hass)
@@ -39,6 +43,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is not None:
+        coordinator.stop_push_listener()
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)

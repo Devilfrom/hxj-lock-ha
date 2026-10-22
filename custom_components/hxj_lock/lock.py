@@ -95,6 +95,8 @@ class HxjLockEntity(CoordinatorEntity, LockEntity):
             "device_mac": info.get("deviceMac"),
             "last_event": events[0]["time"] + " " + events[0]["title"] if events else None,
             "event_count": len(events),
+            "remote_lock_supported": False,
+            "note": "云锁通道仅支持远程开锁; 关门由门体机械回锁完成, 并以关门事件上报",
         }
 
     # ---------- 开锁 ----------

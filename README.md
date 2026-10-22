@@ -16,10 +16,12 @@ custom_components/hxj_lock/
 ├── manifest.json        清单 (requirements 为空)
 ├── const.py             常量
 ├── config_flow.py       UI 配置流程 (账号/密码/极验令牌/reauth/选项)
-├── coordinator.py       数据协调器 (每轮独立 TCP 连接)
+├── coordinator.py       数据协调器 (轮询 + 实时推送监听)
 ├── lock.py              锁实体 (远程开锁)
 ├── binary_sensor.py     在线状态
 ├── sensor.py            最近事件
+├── event.py             事件实体 (开门/关门/报警/低电量…)
+├── device_trigger.py    设备触发器 (自动化用"门锁事件"触发)
 ├── protocol.py          协议客户端 (HSP 帧 + DES-CBC + HMAC 签名)
 ├── hxj_crypto.py        纯 Python 单 DES / RSA
 ├── client.crt / client.key   客户端证书 (提取自 App 的 client.p12)
@@ -73,9 +75,67 @@ custom_components/hxj_lock/
 | `lock.<设备名>` | lock | 显示 locked/unlocked; `unlock` 服务 = 远程开锁 |
 | `binary_sensor.<设备名>_在线状态` | connectivity | deviceState==3 为在线; 属性含 rssi/MAC/版本 |
 | `sensor.<设备名>_最近事件` | sensor | 如 `2026-10-21 19:10:02 开门 钥匙:002`; 属性含最近 N 条事件 |
+| `event.<设备名>_事件` | event | 事件实体, 状态即最近一次事件类型 (open/close/alarm/…); 属性含 title/log_id/time/has_media |
 
 注意: 云端协议不反馈门闩实际开/关状态, 锁实体默认显示 locked,
 执行开锁后 10 秒内显示 unlocked, 之后恢复。
+
+> **关于"远程上锁"**: 云锁通道 (`appCloudDeviceList`) 逆出的命令里只有
+> `appCloudOpenLock`, **没有远程上锁/关门接口** —— `appCloseDoorLock` 属于
+> 普通网关门锁通道, 与云锁无关。所以本集成只暴露 `LockEntityFeature.OPEN`,
+> 关门靠门体机械回锁, 完成后再以"关门"事件上报。`lock.lock` 服务对该实体
+> 不可用属预期行为, 不是 bug。
+
+## 门锁事件通知
+
+开门 / 关门 / 报警 / 低电量 / 新增删除用户 / 门前抓拍等事件会**同时**走三条通道
+(实测从开锁到送达约 3~5 秒):
+
+| 通道 | 用途 |
+|---|---|
+| **事件实体** `event.<设备名>_事件` | 状态变为事件类型, 可用"事件"触发器写自动化 |
+| **总线事件** `hxj_lock_event` | 载荷含 `device_id` / `event_type` / `title` / `log_id` / `time` / `has_media` |
+| **HA 持久通知** | 前端通知面板弹出"门锁事件 · 开门" (选项里可关) |
+
+事件来源是**服务端实时推送** `appCloudLockEventPush`: 集成在后台维持一条长连接,
+服务端把事件排队, 在客户端下次鉴权时下发 (空闲约 90s 会断, 集成每 45s 主动重连
+一次以尽快取走)。同时保留 `appCloudLockLogList` 轮询作为兜底, 两条路径按
+`logId` 去重, 同一事件只通知一次。
+
+> 持久通知是**内存态**的, HA 重启后消失。要留痕 / 推手机请用通知服务
+> (如 WxPusher), 见下方自动化示例。
+
+用设备触发器 (推荐, 可按事件类型细分):
+
+```yaml
+automation:
+  - alias: 门锁事件通知
+    trigger:
+      - platform: device
+        domain: hxj_lock
+        device_id: <设备ID>          # 设备 → 设备ID, 或在 UI 里选
+        type: open                  # open / close / alarm / low_battery / add_user / del_user / cat_eye / other
+    action:
+      - service: notify.wxpusher
+        data:
+          title: 门锁事件
+          message: "{{ trigger.event.title }}"
+```
+
+用事件实体:
+
+```yaml
+automation:
+  - alias: 门锁事件通知 (事件实体)
+    trigger:
+      - platform: event
+        event_type: event.men_kou_da_men_suo_3_shi_jian
+    action:
+      - service: notify.wxpusher
+        data:
+          title: "{{ trigger.event.data.title }}"
+          message: "{{ trigger.event.data.time }}"
+```
 
 ## 服务
 
@@ -101,7 +161,14 @@ automation:
 
 ## 选项
 
-集成 → 齿轮 → 选项: 轮询间隔 (默认 300 秒) / 日志条数 (默认 5) / 设备名筛选。
+集成 → 齿轮 → 选项:
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| 轮询间隔 (秒) | 300 | 轮询兜底间隔; 实时推送不受它影响 |
+| 日志条数 | 5 | 每次拉取的开门记录条数 |
+| 设备名筛选 | 空 | 留空 = 账号下全部云锁; 填设备名 = 只匹配该锁 |
+| 事件通知 | 开 | 关掉后不再弹 HA 持久通知 (事件实体与总线事件仍照发) |
 
 ## 故障排查
 
@@ -111,6 +178,9 @@ automation:
 | 弹出"需要重新身份验证" | tokenId 失效 | 重跑 geetest_login.py → `hxj_lock.set_token` 或 reauth 粘贴 |
 | 日志 `UpdateFailed` | 网络不通/服务端关闭连接 | 自动在下轮重试; 检查 HA 到 iot.hxjiot.com:9595 连通性 |
 | 设备列表为空 | 账号下没有云锁 (只有普通门锁) | App 里确认设备类型; 普通门锁通道见逆向报告 2.5 |
+| 集成一直 `not_loaded`, 日志报 `Unable to import component: No module named 'custom_components.hxj_lock.xxx'` | **`custom_components/` 下存在带 `manifest.json` 的备份目录** (如 `hxj_lock.bak`) | HA 会把每个子目录都当集成加载, 含点号的目录名不是合法 Python 包名 → 整个 domain 无法 setup, 条目永远 `not_loaded`。**把备份目录移出 `custom_components/`** (放 `/config/` 或别处) |
+| 实体突然全部 `unavailable` | 云端瞬时返回空设备列表 | 集成已做保护 (保留上次数据), 不会误判离线; 日志可见 `保留上次数据` |
+| 前端通知面板没有门锁通知 | 持久通知是内存态, HA 重启后清空 | 属预期行为; 要留痕请用 WxPusher 等通知服务 |
 
 开启调试日志:
 

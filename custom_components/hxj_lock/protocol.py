@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import socket
@@ -26,6 +27,8 @@ import uuid
 
 from .hxj_crypto import (des_cbc_decrypt, des_cbc_encrypt,
                          pkcs5_pad, pkcs5_unpad, rsa_encrypt_pkcs1_v15)
+
+_LOGGER = logging.getLogger(__name__)
 
 # ---------------- 协议常量 (ServerConfigImpl / HMacSha256Utils 还原) ----------------
 SERVER_DOMAIN = "iot.hxjiot.com"
@@ -133,6 +136,9 @@ class HxjClient:
         self._sock = None
         self._lock = threading.RLock()
         self._ssl_ctx = self._build_ssl_ctx()
+        # 服务端主动推送帧缓冲 (appCloudLockEventPush 等)
+        self._push_events: list[dict] = []
+        self._push_lock = threading.Lock()
 
     # ---------- mTLS ----------
     @staticmethod
@@ -301,11 +307,84 @@ class HxjClient:
         self._sock.sendall(build_frame(enc, method, serial, encrypted=True))
         self._sock.settimeout(timeout)
         resp = self._recv_frame()
-        for _ in range(3):  # 跳过推送帧
-            if resp.get("_serial") == serial:
+        # 服务端会主动推送事件帧 (appCloudLockEventPush 等), 必须一直跳过到拿到
+        # 本请求对应的响应帧为止。否则会把推送帧误当成本次响应返回 —— 曾导致
+        # appCloudDeviceList 被解析成 "0 台设备", 实体全部变 unavailable。
+        # 推送帧单独收集起来, 供上层实时消费。
+        for _ in range(20):
+            if resp.get("method") == method:
                 break
+            if resp.get("_serial") == serial and "resultCode" in resp:
+                break
+            self._record_push(resp)
             resp = self._recv_frame()
+        else:
+            raise HxjProtocolError(
+                f"{method} 未收到对应响应 (最后收到 method={resp.get('method')})")
         return resp
+
+    # ---------- 服务端主动推送 ----------
+    @staticmethod
+    def _is_push_frame(frame: dict) -> bool:
+        method = frame.get("method") or ""
+        return "Push" in method or "Event" in method
+
+    def _record_push(self, frame: dict) -> None:
+        """记录一条服务端主动推送帧"""
+        if not self._is_push_frame(frame):
+            return
+        if not isinstance(frame.get("data"), dict):
+            return
+        with self._push_lock:
+            self._push_events.append(frame)
+            if len(self._push_events) > 100:
+                del self._push_events[:-100]
+
+    def pop_push_events(self) -> list[dict]:
+        """取出并清空缓冲的推送帧"""
+        with self._push_lock:
+            events = list(self._push_events)
+            self._push_events.clear()
+        return events
+
+    def listen_push(self, on_event, stop_event: threading.Event,
+                    reconnect_delay: float = 3.0,
+                    max_lifetime: float = 45.0) -> None:
+        """长连接监听服务端主动推送 (appCloudLockEventPush)。
+
+        服务端会把门锁事件排队, 在客户端"下次鉴权"时才下发, 且空闲约 90s 会主动
+        断开连接。因此这里每 max_lifetime 秒主动重连一次, 保证排队的事件能及时取走。
+
+        在独立线程中运行, 断线自动重连, 直到 stop_event 被置位。
+        on_event 在监听线程中被调用, 调用方需自行切回事件循环。
+        """
+        while not stop_event.is_set():
+            try:
+                self.tcp_connect()      # 内部已完成 tokenId 授权握手
+                deadline = time.monotonic() + max_lifetime
+                while not stop_event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break           # 主动重连, 去取服务端排队的事件
+                    self._sock.settimeout(min(remaining, 5.0))
+                    try:
+                        frame = self._recv_frame()
+                    except (socket.timeout, TimeoutError):
+                        continue
+                    if not self._is_push_frame(frame):
+                        continue
+                    self._record_push(frame)
+                    on_event(frame)
+            except HxjAuthError:
+                _LOGGER.error("hxj_lock: 推送监听鉴权失败, 停止监听")
+                return
+            except Exception as err:  # noqa: BLE001
+                if stop_event.is_set():
+                    break
+                _LOGGER.debug("hxj_lock: 推送连接异常, %.1fs 后重连: %s",
+                              reconnect_delay, err)
+                time.sleep(reconnect_delay)
+        self.close()
 
     # ---------- 业务接口 ----------
     def cloud_device_list(self, start_num: int = 0, get_num: int = 20) -> dict:
@@ -345,6 +424,35 @@ def event_title(row: dict) -> str:
     if key:
         title += f" 钥匙:{key}"
     return title
+
+
+# 事件语义分类 -> HA event 子类型 (event_category 返回的 key 即 EVENT_TYPES 的键)
+def event_category(row: dict) -> str:
+    """日志行 -> 语义类型 key (open/close/alarm/low_battery/add_user/del_user/cat_eye/other)"""
+    lt, lit = row.get("logType"), row.get("logInfoType")
+    if lt == 0:
+        return "close"
+    if lt == 1:
+        return "open"
+    if lt == 2:
+        return "alarm"
+    if lt == 3:
+        return "cat_eye"          # 抓拍/视频媒体事件
+    if lt == 4:
+        if lit in (6, 7, 16, 17):
+            return "open"
+        if lit == 5:
+            return "close"
+        if lit == 3:
+            return "alarm"
+        if lit == 8:
+            return "low_battery"
+        if lit == 9:
+            return "add_user"
+        if lit in (10, 11, 13, 32):
+            return "del_user"
+        return "other"
+    return "other"
 
 
 def event_has_media(log_type: int, log_info_type: int) -> bool:

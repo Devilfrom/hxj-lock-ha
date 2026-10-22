@@ -15,12 +15,29 @@ CONF_DEVICE_NAME = "device_name"
 # 选项
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_LOG_COUNT = "log_count"
+CONF_NOTIFY = "notify"           # 门锁事件是否推送 HA 通知
 
 DEFAULT_SCAN_INTERVAL = 300      # 秒
 DEFAULT_LOG_COUNT = 5
+DEFAULT_NOTIFY = True
 DEVICE_TYPE_CLOUD_LOCK = 2       # appCloudOpenLock/appCloudLockLogList 固定 deviceType=2
 
-PLATFORMS = [Platform.LOCK, Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS = [Platform.LOCK, Platform.BINARY_SENSOR, Platform.SENSOR, Platform.EVENT]
+
+# 门锁事件 -> HA event 子类型 / device_trigger subtype
+# (logType, logInfoType) 分类见 protocol.event_category
+EVENT_FIRE_TYPE = "hxj_lock_event"   # coordinator 发出的 bus 事件类型
+
+EVENT_TYPES = {
+    "open":        {"name": "开门",         "icon": "mdi:door-open"},
+    "close":       {"name": "关门",         "icon": "mdi:door-closed"},
+    "alarm":       {"name": "报警",         "icon": "mdi:bell-alert"},
+    "low_battery": {"name": "低电量",       "icon": "mdi:battery-alert"},
+    "add_user":    {"name": "新增用户",     "icon": "mdi:account-plus"},
+    "del_user":    {"name": "删除用户",     "icon": "mdi:account-minus"},
+    "cat_eye":     {"name": "门前抓拍/视频", "icon": "mdi:cctv"},
+    "other":       {"name": "其他门锁消息",  "icon": "mdi:lock"},
+}
 
 # 服务
 SERVICE_SET_TOKEN = "set_token"
